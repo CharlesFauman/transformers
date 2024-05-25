@@ -729,12 +729,32 @@ class LlamaDecoderLayer(nn.Module):
         outputs = (hidden_states,)
 
         if output_attentions:
-            outputs += (self_attn_weights,)
+            # NOTE: @@@ changed 
+            # outputs += (self_attn_weights,)
+            outputs += (avg_layer(self_attn_weights),)
 
         if use_cache:
             outputs += (present_key_value,)
 
         return outputs
+
+
+def avg_layer(layer, device="cuda"):
+    layer_attns = layer.squeeze(0)
+    attns_per_head = layer_attns.mean(dim=0)
+    vec = torch.concat((
+        # We zero the first entry because it's what's called
+        # null attention (https://aclanthology.org/W19-4808.pdf)
+        torch.tensor([0.]).to(device),
+        # usually there's only one item in attns_per_head but
+        # on the first generation, there's a row for each token
+        # in the prompt as well, so take [-1]
+        attns_per_head[-1][1:],
+        # add zero for the final generated token, which never
+        # gets any attention
+        torch.tensor([0.]).to(device),
+    ))
+    return vec / vec.sum()
 
 
 LLAMA_START_DOCSTRING = r"""
@@ -946,10 +966,10 @@ class LlamaModel(LlamaPreTrainedModel):
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
-        all_self_attns = () if output_attentions else None
+        mean_attn = None
         next_decoder_cache = None
 
-        for decoder_layer in self.layers:
+        for i, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -981,7 +1001,11 @@ class LlamaModel(LlamaPreTrainedModel):
                 next_decoder_cache = layer_outputs[2 if output_attentions else 1]
 
             if output_attentions:
-                all_self_attns += (layer_outputs[1],)
+                # NOTE: @@@ compute mean of attention over layers on the fly
+                if mean_attn is None:
+                    mean_attn = layer_outputs[1]
+                else:
+                    mean_attn += (layer_outputs[1] - mean_attn) / i
 
         hidden_states = self.norm(hidden_states)
 
@@ -994,12 +1018,12 @@ class LlamaModel(LlamaPreTrainedModel):
             next_cache = next_cache.to_legacy_cache()
 
         if not return_dict:
-            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, mean_attn] if v is not None)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
-            attentions=all_self_attns,
+            attentions=mean_attn,
         )
 
     def _update_causal_mask(
